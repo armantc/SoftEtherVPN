@@ -121,7 +121,7 @@ from GitHub. You may make your own fork project from our project.
 
 The download and build instruction is following:
 
-$ git clone https://github.com/SoftEtherVPN/SoftEtherVPN_Stable.git
+$ git clone https://github.com/armantc/SoftEtherVPN.git
 $ cd SoftEtherVPN
 $ ./configure
 $ make
