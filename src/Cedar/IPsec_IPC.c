@@ -814,6 +814,11 @@ bool IPCDhcpAllocateIP(IPC *ipc, DHCP_OPTION_LIST *opt, TUBE *discon_poll_tube)
 }
 bool IPCDhcpAllocateIPEx(IPC *ipc, DHCP_OPTION_LIST *opt, TUBE *discon_poll_tube, bool openvpn_compatible)
 {
+
+	if(openvpn_compatible){
+		return IPCDhcpAllocateIPoVPN(ipc, opt, discon_poll_tube);
+	}
+
 	DHCP_OPTION_LIST req;
 	DHCPV4_DATA *d, *d2;
 	UINT tran_id = Rand32();
@@ -1027,6 +1032,113 @@ LABEL_CLEANUP:
 		ReleaseList(release_list);
 	}
 	return ret;
+}
+
+bool IPCDhcpAllocateIPoVPN(IPC *ipc, DHCP_OPTION_LIST *opt, TUBE *discon_poll_tube)
+{
+	DHCP_OPTION_LIST req;
+	DHCPV4_DATA *d, *d2;
+	UINT tran_id = Rand32();
+	bool ok;
+	// Validate arguments
+	if (ipc == NULL || opt == NULL)
+	{
+		return false;
+	}
+
+	// Send a DHCP Discover
+	Zero(&req, sizeof(req));
+	req.RequestedIp = 0;
+	req.Opcode = DHCP_DISCOVER;
+	StrCpy(req.Hostname, sizeof(req.Hostname), ipc->ClientHostname);
+	IPCDhcpSetConditionalUserClass(ipc, &req);
+
+	d = IPCSendDhcpRequest(ipc, NULL, tran_id, &req, DHCP_OFFER, IPC_DHCP_TIMEOUT, discon_poll_tube);
+	if (d == NULL)
+	{
+		return false;
+	}
+
+	// Analyze the DHCP Offer
+	ok = true;
+	if (IsValidUnicastIPAddressUINT4(d->ParsedOptionList->ClientAddress) == false)
+	{
+		ok = false;
+	}
+	if (IsValidUnicastIPAddressUINT4(d->ParsedOptionList->ServerAddress) == false)
+	{
+		ok = false;
+	}
+	if (d->ParsedOptionList->SubnetMask == 0)
+	{
+		ok = false;
+	}
+	if (d->ParsedOptionList->LeaseTime == 0)
+	{
+		d->ParsedOptionList->LeaseTime = IPC_DHCP_DEFAULT_LEASE;
+	}
+	if (d->ParsedOptionList->LeaseTime <= IPC_DHCP_MIN_LEASE)
+	{
+		d->ParsedOptionList->LeaseTime = IPC_DHCP_MIN_LEASE;
+	}
+
+	if (ok == false)
+	{
+		FreeDHCPv4Data(d);
+		return false;
+	}
+
+	// Send a DHCP Request
+	Zero(&req, sizeof(req));
+	req.Opcode = DHCP_REQUEST;
+	StrCpy(req.Hostname, sizeof(req.Hostname), ipc->ClientHostname);
+	req.ServerAddress = d->ParsedOptionList->ServerAddress;
+	req.RequestedIp = d->ParsedOptionList->ClientAddress;
+	IPCDhcpSetConditionalUserClass(ipc, &req);
+
+	d2 = IPCSendDhcpRequest(ipc, NULL, tran_id, &req, DHCP_ACK, IPC_DHCP_TIMEOUT, discon_poll_tube);
+	if (d2 == NULL)
+	{
+		FreeDHCPv4Data(d);
+		return false;
+	}
+
+	// Analyze the DHCP Ack
+	ok = true;
+	if (IsValidUnicastIPAddressUINT4(d2->ParsedOptionList->ClientAddress) == false)
+	{
+		ok = false;
+	}
+	if (IsValidUnicastIPAddressUINT4(d2->ParsedOptionList->ServerAddress) == false)
+	{
+		ok = false;
+	}
+	if (d2->ParsedOptionList->SubnetMask == 0)
+	{
+		ok = false;
+	}
+	if (d2->ParsedOptionList->LeaseTime == 0)
+	{
+		d2->ParsedOptionList->LeaseTime = IPC_DHCP_DEFAULT_LEASE;
+	}
+	if (d2->ParsedOptionList->LeaseTime <= IPC_DHCP_MIN_LEASE)
+	{
+		d2->ParsedOptionList->LeaseTime = IPC_DHCP_MIN_LEASE;
+	}
+
+	if (ok == false)
+	{
+		FreeDHCPv4Data(d);
+		FreeDHCPv4Data(d2);
+		return false;
+	}
+
+	Copy(opt, d2->ParsedOptionList, sizeof(DHCP_OPTION_LIST));
+
+	FreeDHCPv4Data(d);
+	FreeDHCPv4Data(d2);
+
+	return true;
 }
 
 // Send out a DHCP request, and wait for a corresponding response
