@@ -234,7 +234,7 @@ void OvsProceccRecvPacket(OPENVPN_SERVER *s, UDPPACKET *p, UINT protocol)
 				}
 				se->Channels[recv_packet->KeyId] = c;
 				Debug("OpenVPN New Channel :%u\n", recv_packet->KeyId);
-				//OvsLog(s, se, c, "LO_NEW_CHANNEL");
+				OvsLog(s, se, c, "LO_NEW_CHANNEL");
 			}
 /*			else if (recv_packet->OpCode == OPENVPN_P_CONTROL_SOFT_RESET_V1)
 			{
@@ -294,38 +294,11 @@ void OvsProceccRecvPacket(OPENVPN_SERVER *s, UDPPACKET *p, UINT protocol)
 					data = recv_packet->Data;
 					size = recv_packet->DataSize;
 
-					if(c->CipherDecrypt->IsAeadCipher)
-					{
-						UCHAR *tag;
-
-						// Update variable part (packet ID) of IV
-						Copy(c->IvRecv, data, sizeof(recv_packet->PacketId));
-						data += sizeof(UINT);
-						size -= sizeof(UINT);
-
-						// tag data
-						tag = data;
-						if(size < OPENVPN_TAG_SIZE) goto decode_error;
-						data += OPENVPN_TAG_SIZE;
-						size -= OPENVPN_TAG_SIZE;
-
-						// Decryption
-						if (size == 0 || (c->CipherDecrypt->BlockSize != 0 && (size % c->CipherDecrypt->BlockSize) != 0)) goto decode_error;
-						size = CipherProcessAead(c->CipherDecrypt, c->IvRecv, tag, OPENVPN_TAG_SIZE, s->TmpBuf, data, size, c->IvRecv, sizeof(UINT));
-						if (size == 0)
-						{
-							Debug("OvsDecrypt(): CipherProcessAead() failed!\n");
-							goto decode_error;
-						}
-						data = s->TmpBuf;
-					}
-					else // Non AEAD cipher
+					if (size >= (c->MdRecv->Size + c->CipherDecrypt->IvSize + sizeof(UINT)))
 					{
 						UCHAR *hmac;
 						UCHAR *iv;
 						UCHAR hmac_test[128];
-
-						if (size < (c->MdRecv->Size + c->CipherDecrypt->IvSize + sizeof(UINT))) goto decode_error;
 
 						// HMAC
 						hmac = data;
@@ -334,59 +307,67 @@ void OvsProceccRecvPacket(OPENVPN_SERVER *s, UDPPACKET *p, UINT protocol)
 
 						// Confirmation of HMAC
 						MdProcess(c->MdRecv, hmac_test, data, size);
-						if (Cmp(hmac_test, hmac, c->MdRecv->Size) != 0) goto decode_error;
-
-						// IV
-						iv = data;
-						data += c->CipherDecrypt->IvSize;
-						size -= c->CipherDecrypt->IvSize;
-
-						// Decryption
-						if (size == 0 || (c->CipherDecrypt->BlockSize != 0 && (size % c->CipherDecrypt->BlockSize) != 0)) goto decode_error;
-						size = CipherProcess(c->CipherDecrypt, iv, s->TmpBuf, data, size);
-						if(size == 0) goto decode_error;
-
-						data = s->TmpBuf;
-						// Seek buffer after the packet ID
-						data += sizeof(UINT);
-						size -= sizeof(UINT);
-					}
-
-					// Update of last communication time
-					se->LastCommTick = s->Now;
-
-					if (size < sizeof(UINT)){
-						goto decode_error;
-					}
-
-
-					if (size >= sizeof(ping_signature) &&
-						Cmp(data, ping_signature, sizeof(ping_signature)) == 0)
-					{
-						// Ignore since a ping packet has been received
-						DoNothing();
-					}
-					else
-					{
-						// Receive a valid data packet!!
-						if (se->Ipc != NULL)
+						if (Cmp(hmac_test, hmac, c->MdRecv->Size) == 0)
 						{
-							switch (se->Mode)
-							{
-							case OPENVPN_MODE_L2:	// Send an Ethernet packet to a session
-								IPCSendL2(se->Ipc, data, size);
-								break;
+							// Update of last communication time
+							se->LastCommTick = s->Now;
 
-							case OPENVPN_MODE_L3:	// Send an IPv4 packet to a session
-								IPCSendIPv4(se->Ipc, data, size);
-								break;
+							// IV
+							iv = data;
+							data += c->CipherDecrypt->IvSize;
+							size -= c->CipherDecrypt->IvSize;
+
+							// Payload
+							if (size >= 1 && (c->CipherDecrypt->BlockSize == 0 || (size % c->CipherDecrypt->BlockSize) == 0))
+							{
+								UINT data_packet_id;
+
+								// Decryption
+								size = CipherProcess(c->CipherDecrypt, iv, s->TmpBuf, data, size);
+
+								data = s->TmpBuf;
+
+								if (size >= sizeof(UINT))
+								{
+									data_packet_id = READ_UINT(data);
+
+									data += sizeof(UINT);
+									size -= sizeof(UINT);
+
+									if (size >= sizeof(ping_signature) &&
+										Cmp(data, ping_signature, sizeof(ping_signature)) == 0)
+									{
+										// Ignore since a ping packet has been received
+										DoNothing();
+									}
+									else
+									{
+										// Receive a packet!!
+										if (se->Ipc != NULL)
+										{
+											switch (se->Mode)
+											{
+											case OPENVPN_MODE_L2:	// Send an Ethernet packet to a session
+												IPCSendL2(se->Ipc, data, size);
+												break;
+
+											case OPENVPN_MODE_L3:	// Send an IPv4 packet to a session
+												IPCSendIPv4(se->Ipc, data, size);
+												break;
+											}
+										}
+									}
+								}
 							}
+						}
+						else
+						{
+//							Debug("HMAC Failed (c=%u)\n", c->KeyId);
 						}
 					}
 				}
 			}
 		}
-decode_error:
 
 		OvsFreePacket(recv_packet);
 	}
@@ -732,8 +713,6 @@ void OvsBeginIPCAsyncConnectionIfEmpty(OPENVPN_SERVER *s, OPENVPN_SESSION *se, O
 			}
 		}
 
-		p.IsOpenVPN = true;
-
 		p.Layer = (se->Mode == OPENVPN_MODE_L2) ? IPC_LAYER_2 : IPC_LAYER_3;
 
 		// Calculate the MSS
@@ -789,7 +768,6 @@ void OvsSetupSessionParameters(OPENVPN_SERVER *s, OPENVPN_SESSION *se, OPENVPN_C
 	LIST *o;
 	BUF *b;
 	char opt_str[MAX_SIZE];
-	char *cipher_name, *md_name;
 	// Validate arguments
 	if (s == NULL || se == NULL || c == NULL || data == NULL)
 	{
@@ -891,6 +869,14 @@ void OvsSetupSessionParameters(OPENVPN_SERVER *s, OPENVPN_SESSION *se, OPENVPN_C
 		}
 	}
 
+	// Encryption algorithm
+	c->CipherEncrypt = OvsGetCipher(IniStrValue(o, "cipher"));
+	c->CipherDecrypt = NewCipher(c->CipherEncrypt->Name);
+
+	// Hash algorithm
+	c->MdSend = OvsGetMd(IniStrValue(o, "auth"));
+	c->MdRecv = NewMd(c->MdSend->Name);
+
 	// Random number generation
 	Rand(c->ServerKey.Random1, sizeof(c->ServerKey.Random1));
 	Rand(c->ServerKey.Random2, sizeof(c->ServerKey.Random2));
@@ -916,45 +902,13 @@ void OvsSetupSessionParameters(OPENVPN_SERVER *s, OPENVPN_SESSION *se, OPENVPN_C
 		c->ExpansionKey, sizeof(c->ExpansionKey));
 	FreeBuf(b);
 
-	// Encryption algorithm
-	cipher_name = IniStrValue(o, "cipher");
-	c->CipherEncrypt = OvsGetCipher(cipher_name);
-	c->CipherDecrypt = OvsGetCipher(cipher_name);
+	// Set the key
 	SetCipherKey(c->CipherDecrypt, c->ExpansionKey + 0, false);
 	SetCipherKey(c->CipherEncrypt, c->ExpansionKey + 128, true);
+	SetMdKey(c->MdRecv, c->ExpansionKey + 64, c->MdRecv->Size);
+	SetMdKey(c->MdSend, c->ExpansionKey + 192, c->MdSend->Size);
 
-	md_name = IniStrValue(o, "auth");
-	if(c->CipherDecrypt->IsAeadCipher){
-		// In AEAD mode the IV is composed by the packet ID and a part of the HMAC key
-		Copy(c->IvRecv + sizeof(c->LastDataPacketId), c->ExpansionKey + 64, c->CipherDecrypt->IvSize - sizeof(c->LastDataPacketId));
-		Copy(c->IvSend + sizeof(c->LastDataPacketId), c->ExpansionKey + 192, c->CipherEncrypt->IvSize - sizeof(c->LastDataPacketId));
-		c->MdSend = NULL;
-		c->MdRecv = NULL;
-	}else{
-		// Hash algorithm
-		c->MdSend = OvsGetMd(md_name);
-		c->MdRecv = OvsGetMd(md_name);
-		SetMdKey(c->MdRecv, c->ExpansionKey + 64, c->MdRecv->Size);
-		SetMdKey(c->MdSend, c->ExpansionKey + 192, c->MdSend->Size);
-	}
-
-	// We pass the cipher name sent from the OpenVPN client, unless it's a different cipher, to prevent a message such as:
-	// WARNING: 'cipher' is used inconsistently, local='cipher AES-128-GCM', remote='cipher aes-128-gcm'
-	// It happens because OpenVPN uses "strcmp()" to compare the local and remote parameters:
-	// https://github.com/OpenVPN/openvpn/blob/a6fd48ba36ede465b0905a95568c3ec0d425ca71/src/openvpn/options.c#L3819-L3831
-	if (StrCmpi(cipher_name, c->CipherEncrypt->Name) != 0)
-	{
-		cipher_name = c->CipherEncrypt->Name;
-	}
-
-	if(c->MdSend != NULL){
-		if (StrCmpi(md_name, c->MdSend->Name) != 0)
-		{
-			md_name = c->MdSend->Name;
-		}
-	}else{
-		md_name = "[null-digest]";
-	}
+	OvsFreeOptions(o);
 
 	// Generate the response option string
 	Format(c->ServerKey.OptionString, sizeof(c->ServerKey.OptionString),
@@ -964,10 +918,8 @@ void OvsSetupSessionParameters(OPENVPN_SERVER *s, OPENVPN_SESSION *se, OPENVPN_C
 		se->LinkMtu,
 		se->TunMtu,
 		c->Proto,
-		cipher_name, md_name, c->CipherEncrypt->KeySize * 8);
+		c->CipherEncrypt->Name, c->MdSend->Name, c->CipherEncrypt->KeySize * 8);
 	Debug("Building OptionStr: %s\n", c->ServerKey.OptionString);
-
-	OvsFreeOptions(o);
 
 	OvsLog(s, se, c, "LO_OPTION_STR_SEND", c->ServerKey.OptionString);
 }
@@ -977,7 +929,7 @@ CIPHER *OvsGetCipher(char *name)
 {
 	CIPHER *c = NULL;
 
-	if (IsEmptyStr(name) == false)
+	if (IsEmptyStr(name) == false && IsStrInStrTokenList(OPENVPN_CIPHER_LIST, name, NULL, false))
 	{
 		c = NewCipher(name);
 	}
@@ -995,7 +947,7 @@ MD *OvsGetMd(char *name)
 {
 	MD *m = NULL;
 
-	if (IsEmptyStr(name) == false)
+	if (IsEmptyStr(name) == false && IsStrInStrTokenList(OPENVPN_MD_LIST, name, NULL, false))
 	{
 		m = NewMd(name);
 	}
@@ -1465,8 +1417,7 @@ OPENVPN_CHANNEL *OvsNewChannel(OPENVPN_SESSION *se, UCHAR key_id)
 
 	c->KeyId = key_id;
 
-	Rand(c->IvSend, sizeof(c->IvSend));
-	Rand(c->IvRecv, sizeof(c->IvRecv));
+	Rand(c->NextIv, sizeof(c->NextIv));
 
 	//c->NextRekey = se->Server->Now + (UINT64)5000;
 
@@ -1514,7 +1465,9 @@ UINT64 OvsNewServerSessionId(OPENVPN_SERVER *s)
 // Build and submit the OpenVPN data packet
 void OvsSendDataPacket(OPENVPN_CHANNEL *c, UCHAR key_id, UINT data_packet_id, void *data, UINT data_size)
 {
-	const UCHAR op = ((OPENVPN_P_DATA_V1 << 3) & 0xF8) | (key_id & 0x07);
+	UCHAR uc;
+	UCHAR *encrypted_data;
+	UINT encrypted_size;
 	UCHAR *dest_data;
 	UINT dest_size;
 	UINT r;
@@ -1525,68 +1478,40 @@ void OvsSendDataPacket(OPENVPN_CHANNEL *c, UCHAR key_id, UINT data_packet_id, vo
 		return;
 	}
 
+	uc = ((OPENVPN_P_DATA_V1 << 3) & 0xF8) | (key_id & 0x07);
+
 	// Generate the data to be encrypted
-	if (c->CipherEncrypt->IsAeadCipher){
-		// [ opcode ] [ - packet ID - ] [ TAG ] [ * packet payload * ]
-		UCHAR tag[16];
-		UINT ret;
 
-		// Update variable part (packet ID) of IV
-		WRITE_UINT(c->IvSend, data_packet_id);
+	encrypted_size = sizeof(UINT) + data_size;
+	encrypted_data = ZeroMalloc(encrypted_size);
 
-		// Prepare a buffer to store the results
-		dest_data = Malloc(sizeof(op) + sizeof(data_packet_id) + sizeof(tag) + data_size + 256);
+	WRITE_UINT(encrypted_data, data_packet_id);
+	Copy(encrypted_data + sizeof(UINT), data, data_size);
 
-		// Set data size to the maximum known
-		dest_size = sizeof(op) + sizeof(data_packet_id) + sizeof(tag);
+	// Prepare a buffer to store the results
+	dest_data = Malloc(sizeof(UCHAR) + c->MdSend->Size + c->CipherEncrypt->IvSize + encrypted_size + 256);
 
-		// Write opcode
-		dest_data[0] = op;
+	// Encrypt
+	r = CipherProcess(c->CipherEncrypt, c->NextIv, dest_data + sizeof(UCHAR) + c->MdSend->Size + c->CipherEncrypt->IvSize,
+		encrypted_data, encrypted_size);
+	dest_size = sizeof(UCHAR) + c->MdSend->Size + c->CipherEncrypt->IvSize + r;
 
-		// Write packet ID
-		WRITE_UINT(dest_data + sizeof(op), data_packet_id);
+	// Copy the IV
+	Copy(dest_data + sizeof(UCHAR) + c->MdSend->Size, c->NextIv, c->CipherEncrypt->IvSize);
 
-		// Write encrypted payload
-		ret = CipherProcessAead(c->CipherEncrypt, c->IvSend, tag, 16, dest_data + dest_size, data, data_size, c->IvSend, sizeof(data_packet_id));
-		if (ret == 0)
-		{
-			Debug("OvsEncrypt(): CipherProcessAead() failed!\n");
-			return;
-		}
-		dest_size += ret;
+	// Calculate the HMAC
+	MdProcess(c->MdSend, dest_data + sizeof(UCHAR), dest_data + sizeof(UCHAR) + c->MdSend->Size,
+		dest_size - sizeof(UCHAR) - c->MdSend->Size);
 
-		// Write authentication tag
-		Copy(dest_data + sizeof(op) + sizeof(data_packet_id), tag, sizeof(tag));
-	}else{
-		// [ opcode ] [ HMAC ] [ - IV - ] [ * packet ID * ] [ * packet payload * ]
-		UINT encrypted_size = sizeof(data_packet_id) + data_size;
-		UCHAR *encrypted_data = ZeroMalloc(encrypted_size);
-		WRITE_UINT(encrypted_data, data_packet_id);
-		Copy(encrypted_data + sizeof(data_packet_id), data, data_size);
+	// Update the NextIV
+	Copy(c->NextIv, dest_data + dest_size - c->CipherEncrypt->IvSize, c->CipherEncrypt->IvSize);
 
-		// Prepare a buffer to store the results
-		dest_data = Malloc(sizeof(op) + c->MdSend->Size + c->CipherEncrypt->IvSize + encrypted_size + 256);
-		dest_data[0] = op;
-
-		// Encrypt
-		r = CipherProcess(c->CipherEncrypt, c->IvSend, dest_data + sizeof(op) + c->MdSend->Size + c->CipherEncrypt->IvSize,
-			encrypted_data, encrypted_size);
-		Free(encrypted_data);
-
-		dest_size = sizeof(op) + c->MdSend->Size + c->CipherEncrypt->IvSize + r;
-
-		// Copy the IV
-		Copy(dest_data + sizeof(op) + c->MdSend->Size, c->IvSend, c->CipherEncrypt->IvSize);
-
-		// Calculate the HMAC
-		MdProcess(c->MdSend, dest_data + sizeof(op), dest_data + sizeof(op) + c->MdSend->Size,
-			dest_size - sizeof(op) - c->MdSend->Size);
-
-		// Update the IV for next
-		Copy(c->IvSend, dest_data + dest_size - c->CipherEncrypt->IvSize, c->CipherEncrypt->IvSize);
-	}
+	// Op-code
+	dest_data[0] = uc;
 
 	OvsSendPacketRawNow(c->Server, c->Session, dest_data, dest_size);
+
+	Free(encrypted_data);
 }
 
 // Build an OpenVPN control packet
@@ -1883,7 +1808,7 @@ OPENVPN_SESSION *OvsNewSession(OPENVPN_SERVER *s, IP *server_ip, UINT server_por
 	Debug("OpenVPN New Session: %s:%u -> %s:%u Proto=%u\n", server_ip_str, server_port,
 		client_ip_str, client_port, protocol);
 
-	//OvsLog(s, se, NULL, "LO_NEW_SESSION", (protocol == OPENVPN_PROTOCOL_UDP ? "UDP" : "TCP"));
+	OvsLog(s, se, NULL, "LO_NEW_SESSION", (protocol == OPENVPN_PROTOCOL_UDP ? "UDP" : "TCP"));
 
 	return se;
 }
@@ -2081,9 +2006,6 @@ void OvsRecvPacket(OPENVPN_SERVER *s, LIST *recv_packet_list, UINT protocol)
 									// if the L3 mode to the option character string
 									DHCP_OPTION_LIST *cao = &se->IpcAsync->L3ClientAddressOption;
 									char ip_client[64];
-									char ip_tunnel_endpoint[64];
-									UINT ip_tunnel_endpoint_32;
-									char ip_network[64];
 									char ip_subnet_mask[64];
 									char ip_dns1[64];
 									char ip_dns2[64];
@@ -2100,25 +2022,17 @@ void OvsRecvPacket(OPENVPN_SERVER *s, LIST *recv_packet_list, UINT protocol)
 									IPToStr32(ip_client, sizeof(ip_client),
 										cao->ClientAddress);
 
-									// Generate a virtual gateway address to be passed to the OpenVPN
-									ip_tunnel_endpoint_32 = Endian32(cao->ClientAddress);
-									ip_tunnel_endpoint_32++;
-									ip_tunnel_endpoint_32 = Endian32(ip_tunnel_endpoint_32);
-									IPToStr32(ip_tunnel_endpoint, sizeof(ip_tunnel_endpoint), ip_tunnel_endpoint_32);
-
-									// Create a subnet information for the LAN
-									IPToStr32(ip_network, sizeof(ip_network),
-										GetNetworkAddress(cao->ClientAddress,
-										cao->SubnetMask));
-
 									IPToStr32(ip_subnet_mask, sizeof(ip_subnet_mask),
 										cao->SubnetMask);
 
 									Format(l3_options, sizeof(l3_options),
+										",topology subnet");
+									StrCat(option_str, sizeof(option_str), l3_options);
+
+									Format(l3_options, sizeof(l3_options),
 										",ifconfig %s %s",
-//										",ifconfig %s %s,route %s %s %s 1",
-										ip_client, ip_tunnel_endpoint, ip_network, ip_subnet_mask,
-										ip_tunnel_endpoint);
+										ip_client,
+										ip_subnet_mask);
 									StrCat(option_str, sizeof(option_str), l3_options);
 
 									// Domain name
@@ -2180,11 +2094,13 @@ void OvsRecvPacket(OPENVPN_SERVER *s, LIST *recv_packet_list, UINT protocol)
 									// Default gateway
 									if (cao->Gateway != 0)
 									{
+										char ip_str[64];
+										IPToStr32(ip_str, sizeof(ip_str), cao->Gateway);
 										Format(l3_options, sizeof(l3_options),
-											",route-gateway %s,redirect-gateway def1", ip_tunnel_endpoint);
+											",route-gateway %s,redirect-gateway def1", ip_str);
 										StrCat(option_str, sizeof(option_str), l3_options);
 
-										IPToStr32(ip_defgw, sizeof(ip_defgw), cao->Gateway);
+										StrCpy(ip_defgw, sizeof(ip_defgw), ip_str);
 									}
 									else
 									{
@@ -2507,7 +2423,7 @@ void OvsRecvPacket(OPENVPN_SERVER *s, LIST *recv_packet_list, UINT protocol)
 			OPENVPN_SESSION *se = LIST_DATA(delete_session_list, i);
 
 			Debug("Deleting Session %p\n", se);
-			//OvsLog(s, se, NULL, "LO_DELETE_SESSION");
+			OvsLog(s, se, NULL, "LO_DELETE_SESSION");
 
 			OvsFreeSession(se);
 
@@ -2642,36 +2558,6 @@ int OvsCompareSessionList(void *p1, void *p2)
 	}
 
 	return 0;
-}
-
-// Identify whether the IP address is compatible to the tun device of OpenVPN
-bool OvsIsCompatibleL3IP(UINT ip)
-{
-	IP p;
-
-	UINTToIP(&p, ip);
-	if ((p.addr[3] % 4) == 1)
-	{
-		return true;
-	}
-
-	return false;
-}
-
-// Get an IP address that is compatible to tun device of the OpenVPN after the specified IP address
-UINT OvsGetCompatibleL3IPNext(UINT ip)
-{
-	ip = Endian32(ip);
-
-	while (true)
-	{
-		if (OvsIsCompatibleL3IP(Endian32(ip)))
-		{
-			return Endian32(ip);
-		}
-
-		ip++;
-	}
 }
 
 // Create a new OpenVPN server

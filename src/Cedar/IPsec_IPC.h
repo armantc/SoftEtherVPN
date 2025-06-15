@@ -264,6 +264,7 @@ BUF *IPCBuildDhcpRequest(IPC *ipc, IP *dest_ip, UINT tran_id, DHCP_OPTION_LIST *
 BUF *IPCBuildDhcpRequestOptions(IPC *ipc, DHCP_OPTION_LIST *opt);
 bool IPCDhcpAllocateIP(IPC *ipc, DHCP_OPTION_LIST *opt, TUBE *discon_poll_tube);
 bool IPCDhcpAllocateIPEx(IPC *ipc, DHCP_OPTION_LIST *opt, TUBE *discon_poll_tube, bool openvpn_compatible);
+bool IPCDhcpAllocateIPoVPN(IPC *ipc, DHCP_OPTION_LIST *opt, TUBE *discon_poll_tube);
 bool IPCDhcpRequestInformIP(IPC *ipc, DHCP_OPTION_LIST *opt, TUBE *discon_poll_tube, IP *client_ip);
 void IPCDhcpRenewIP(IPC *ipc, IP *dhcp_server);
 void IPCDhcpFreeIP(IPC *ipc, IP *dhcp_server);
